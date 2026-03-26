@@ -21,9 +21,14 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ... import initialization as init
+from ... import requires_backends
 from ...backbone_utils import load_backbone
 from ...image_transforms import center_to_corners_format
 from ...integrations import use_kernel_forward_from_hub
+from ...loss.loss_for_object_detection import (
+    generalized_box_iou,
+    sigmoid_focal_loss,
+)
 from ...modeling_outputs import BaseModelOutput
 from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
@@ -32,6 +37,7 @@ from ...utils import (
     TensorType,
     TransformersKwargs,
     auto_docstring,
+    is_scipy_available,
     logging,
     torch_compilable_check,
 )
@@ -46,7 +52,10 @@ from ..detr.modeling_detr import (
     DetrDecoderOutput,
     DetrEncoder,
     DetrEncoderLayer,
+    DetrForObjectDetectionCriterion,
+    DetrHungarianMatcher,
     DetrLearnedPositionEmbedding,
+    DetrLoss,
     DetrMLP,
     DetrMLPPredictionHead,
     DetrObjectDetectionOutput,
@@ -55,6 +64,10 @@ from ..detr.modeling_detr import (
     replace_batch_norm,
 )
 from .configuration_deformable_detr import DeformableDetrConfig
+
+
+if is_scipy_available():
+    from scipy.optimize import linear_sum_assignment
 
 
 logger = logging.get_logger(__name__)
@@ -1351,6 +1364,120 @@ class DeformableDetrModel(DeformableDetrPreTrainedModel):
         )
 
 
+class DeformableDetrHungarianMatcher(DetrHungarianMatcher):
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """
+        Differences:
+        - out_prob = outputs["logits"].flatten(0, 1).sigmoid() instead of softmax
+        - class_cost uses alpha and gamma
+        """
+        batch_size, num_queries = outputs["logits"].shape[:2]
+
+        # We flatten to compute the cost matrices in a batch
+        out_prob = outputs["logits"].flatten(0, 1).sigmoid()  # [batch_size * num_queries, num_classes]
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
+
+        # Also concat the target labels and boxes
+        target_ids = torch.cat([v["class_labels"] for v in targets])
+        target_bbox = torch.cat([v["boxes"] for v in targets])
+
+        # Compute the classification cost.
+        alpha = 0.25
+        gamma = 2.0
+        neg_cost_class = (1 - alpha) * (out_prob**gamma) * (-(1 - out_prob + 1e-8).log())
+        pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
+        class_cost = pos_cost_class[:, target_ids] - neg_cost_class[:, target_ids]
+
+        # Compute the L1 cost between boxes
+        bbox_cost = torch.cdist(out_bbox, target_bbox, p=1)
+
+        # Compute the giou cost between boxes
+        giou_cost = -generalized_box_iou(center_to_corners_format(out_bbox), center_to_corners_format(target_bbox))
+
+        # Final cost matrix
+        cost_matrix = self.bbox_cost * bbox_cost + self.class_cost * class_cost + self.giou_cost * giou_cost
+        cost_matrix = cost_matrix.view(batch_size, num_queries, -1).cpu()
+
+        sizes = [len(v["boxes"]) for v in targets]
+        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(cost_matrix.split(sizes, -1))]
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+
+
+class DeformableDetrLoss(DetrLoss):
+    def __init__(self, config, losses, weight_dict):
+        nn.Module.__init__(self)
+        requires_backends(self, ["scipy"])
+        self.auxiliary_loss = config.auxiliary_loss
+        self.matcher = DeformableDetrHungarianMatcher(
+            class_cost=config.class_cost, bbox_cost=config.bbox_cost, giou_cost=config.giou_cost
+        )
+        self.num_classes = config.num_labels
+        self.losses = losses
+        self.focal_alpha = config.focal_alpha
+
+        self.weight_dict = weight_dict
+        if self.auxiliary_loss:
+            aux_weight_dict = {}
+            for i in range(config.decoder_layers - 1):
+                aux_weight_dict.update({k + f"_{i}": v for k, v in self.weight_dict.items()})
+            self.weight_dict.update(aux_weight_dict)
+
+    @torch.no_grad()
+    def loss_cardinality(self, outputs, targets, indices, num_boxes):
+        """
+        Compute the cardinality error, i.e. the absolute error in the number of predicted non-empty boxes.
+
+        This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients.
+        """
+        logits = outputs["logits"]
+        device = logits.device
+        target_lengths = torch.as_tensor([len(v["class_labels"]) for v in targets], device=device)
+        # Count the number of predictions that are NOT "no-object" (sigmoid > 0.5 threshold)
+        card_pred = (logits.sigmoid().max(-1).values > 0.5).sum(1)
+        card_err = nn.functional.l1_loss(card_pred.float(), target_lengths.float())
+        losses = {"cardinality_error": card_err}
+        return losses
+
+    # removed logging parameter, which was part of the original implementation
+    def loss_labels(self, outputs, targets, indices, num_boxes):
+        """
+        Classification loss (Binary focal loss) targets dicts must contain the key "class_labels" containing a tensor
+        of dim [nb_target_boxes]
+        """
+        if "logits" not in outputs:
+            raise KeyError("No logits were found in the outputs")
+        source_logits = outputs["logits"]
+
+        idx = self._get_source_permutation_idx(indices)
+        target_classes_o = torch.cat([t["class_labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(
+            source_logits.shape[:2], self.num_classes, dtype=torch.int64, device=source_logits.device
+        )
+        target_classes[idx] = target_classes_o
+
+        target_classes_onehot = torch.zeros(
+            [source_logits.shape[0], source_logits.shape[1], source_logits.shape[2] + 1],
+            dtype=source_logits.dtype,
+            layout=source_logits.layout,
+            device=source_logits.device,
+        )
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+
+        target_classes_onehot = target_classes_onehot[:, :, :-1]
+        loss_ce = (
+            sigmoid_focal_loss(source_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2)
+            * source_logits.shape[1]
+        )
+        losses = {"loss_ce": loss_ce}
+
+        return losses
+
+
+class DeformableDetrForObjectDetectionCriterion(DetrForObjectDetectionCriterion):
+    pass
+
+
 class DeformableDetrMLPPredictionHead(DetrMLPPredictionHead):
     pass
 
@@ -1397,6 +1524,8 @@ class DeformableDetrForObjectDetection(DeformableDetrPreTrainedModel):
         if config.two_stage:
             self.model.decoder.class_embed = self.class_embed
             self._tied_weights_keys["class_embed"] = "model.decoder.class_embed"
+
+        self.criterion = DeformableDetrForObjectDetectionCriterion(config)
         self.post_init()
 
     @auto_docstring
@@ -1503,14 +1632,8 @@ class DeformableDetrForObjectDetection(DeformableDetrPreTrainedModel):
 
         loss, loss_dict, auxiliary_outputs = None, None, None
         if labels is not None:
-            loss, loss_dict, auxiliary_outputs = self.loss_function(
-                logits,
-                labels,
-                self.device,
-                pred_boxes,
-                self.config,
-                outputs_class,
-                outputs_coord,
+            loss, loss_dict, auxiliary_outputs = self.criterion(
+                logits, labels, pred_boxes, outputs_class, outputs_coord
             )
 
         return DeformableDetrObjectDetectionOutput(
