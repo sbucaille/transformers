@@ -155,7 +155,6 @@ LOSS_MAPPING = {
     "ForObjectDetection": ForObjectDetectionLoss,
     "ForConditionalGeneration": ForCausalLMLoss,
     "ConditionalDetrForObjectDetection": DeformableDetrForObjectDetectionLoss,
-    "DabDetrForObjectDetection": DeformableDetrForObjectDetectionLoss,
     "GroundingDinoForObjectDetection": GroundingDinoForObjectDetectionLoss,
     "MMGroundingDinoForObjectDetection": GroundingDinoForObjectDetectionLoss,
     "ConditionalDetrForSegmentation": DeformableDetrForSegmentationLoss,
