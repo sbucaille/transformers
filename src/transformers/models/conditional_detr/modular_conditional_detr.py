@@ -39,6 +39,7 @@ from ..deformable_detr.modeling_deformable_detr import (
     DeformableDetrForObjectDetectionCriterion,
     DeformableDetrLoss,
     inverse_sigmoid,
+)
 from ..detr.image_processing_detr import DetrImageProcessor
 from ..detr.image_processing_pil_detr import DetrImageProcessorPil
 from ..detr.modeling_detr import (
@@ -49,7 +50,7 @@ from ..detr.modeling_detr import (
     DetrEncoderLayer,
     DetrForObjectDetection,
     DetrForSegmentation,
-    DetrHungarianMatcher,
+    DetrForSegmentationCriterion,
     DetrLearnedPositionEmbedding,
     DetrMLP,
     DetrMLPPredictionHead,
@@ -666,6 +667,38 @@ class ConditionalDetrPreTrainedModel(DetrPreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [
         r"detr\.model\.backbone\.model\.layer\d+\.0\.downsample\.1\.num_batches_tracked"
     ]
+    # Difference here is the removal of empty weight initialization which depends on eof_coef which is not used in Conditional DETR
+    def _init_weights(self, module):
+        std = self.config.init_std
+        xavier_std = self.config.init_xavier_std
+
+        if isinstance(module, ConditionalDetrMaskHeadSmallConv):
+            # ConditionalDetrMaskHeadSmallConv uses kaiming initialization for all its Conv2d layers
+            for m in module.modules():
+                if isinstance(m, nn.Conv2d):
+                    init.kaiming_uniform_(m.weight, a=1)
+                    if m.bias is not None:
+                        init.constant_(m.bias, 0)
+        elif isinstance(module, ConditionalDetrMHAttentionMap):
+            init.zeros_(module.k_proj.bias)
+            init.zeros_(module.q_proj.bias)
+            init.xavier_uniform_(module.k_proj.weight, gain=xavier_std)
+            init.xavier_uniform_(module.q_proj.weight, gain=xavier_std)
+        elif isinstance(module, ConditionalDetrLearnedPositionEmbedding):
+            init.uniform_(module.row_embeddings.weight)
+            init.uniform_(module.column_embeddings.weight)
+        elif isinstance(module, (nn.Linear, nn.Conv2d)):
+            init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            init.normal_(module.weight, mean=0.0, std=std)
+            # Here we need the check explicitly, as we slice the weight in the `zeros_` call, so it looses the flag
+            if module.padding_idx is not None and not getattr(module.weight, "_is_hf_initialized", False):
+                init.zeros_(module.weight[module.padding_idx])
+        elif isinstance(module, (nn.LayerNorm, nn.GroupNorm)):
+            init.ones_(module.weight)
+            init.zeros_(module.bias)
 
 
 class ConditionalDetrEncoder(DetrEncoder):
@@ -952,11 +985,11 @@ class ConditionalDetrModel(DetrModel):
         )
 
 
-class ConditionalDetrForObjectDetectionLoss(DeformableDetrLoss):
+class ConditionalDetrLoss(DeformableDetrLoss):
     pass
 
 
-class ConditionalDetrForObjectDetectionCriterion(DeformableDetrForObjectDetectionCriterion):
+class ConditionalDetrCriterion(DeformableDetrForObjectDetectionCriterion):
     def __init__(self, config):
         super().__init__(config)
         self.loss_module = ConditionalDetrForObjectDetectionLoss(config, losses, weight_dict)
@@ -1091,39 +1124,8 @@ class ConditionalDetrForObjectDetection(DetrForObjectDetection):
             encoder_attentions=outputs.encoder_attentions,
         )
 
-
-class ConditionalDetrForSegmentationHungarianMatcher(DetrHungarianMatcher):
+class ConditionalDetrForSegmentationCriterion(DetrForSegmentationCriterion):
     pass
-
-
-class ConditionalDetrForSegmentationLoss(DeformableDetrLoss):
-    def __init__(self, config, losses, weight_dict):
-        super().__init__(config, losses, weight_dict)
-        self.matcher = ConditionalDetrForSegmentationHungarianMatcher(
-            class_cost=config.class_cost, bbox_cost=config.bbox_cost, giou_cost=config.giou_cost
-        )
-
-
-class ConditionalDetrForSegmentationCriterion(DeformableDetrForObjectDetectionCriterion):
-    def __init__(self, config):
-        super().__init__(config)
-        self.loss_module = ConditionalDetrForSegmentationLoss(config, losses, weight_dict)
-
-    def forward(self, logits, labels, pred_boxes, pred_masks, outputs_class=None, outputs_coord=None):
-        outputs_loss = {}
-        auxiliary_outputs = None
-        outputs_loss["logits"] = logits
-        outputs_loss["pred_boxes"] = pred_boxes
-        outputs_loss["pred_masks"] = pred_masks
-        if self.auxiliary_loss:
-            auxiliary_outputs = _set_aux_loss(outputs_class, outputs_coord)
-            outputs_loss["auxiliary_outputs"] = auxiliary_outputs
-
-        loss_dict = self.loss_module(outputs_loss, labels)
-
-        loss = self.loss_module.get_weighted_loss(loss_dict)
-        return loss, loss_dict, auxiliary_outputs
-
 
 class ConditionalDetrForSegmentation(DetrForSegmentation):
     def forward(

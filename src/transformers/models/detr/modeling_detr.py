@@ -1790,6 +1790,7 @@ class DetrForSegmentationCriterion(nn.Module):
             "loss_mask": config.mask_loss_coefficient,
             "loss_dice": config.dice_loss_coefficient,
         }
+        self.auxiliary_loss = config.auxiliary_loss
         self.loss_module = DetrLoss(config, losses, weight_dict)
 
     def forward(self, logits, labels, pred_boxes, pred_masks, outputs_class=None, outputs_coord=None):
