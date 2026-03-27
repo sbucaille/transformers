@@ -52,7 +52,11 @@ from ...image_utils import (
     validate_annotations,
 )
 from ...processing_utils import ImagesKwargs, Unpack
-from ...utils import TensorType, auto_docstring, is_torchvision_available
+from ...utils import (
+    TensorType,
+    auto_docstring,
+    is_torchvision_available,
+)
 
 
 if TYPE_CHECKING:
